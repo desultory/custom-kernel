@@ -21,11 +21,10 @@ class KConfig:
     They share a common base path and architecture, and can be used to parse KConfig files
     """
     _source_regex = r'source\s+\"(.*)\"'
-    _general_starts = ['menu', 'choice', 'config', 'if']
+    _general_starts = ['menu', 'choice', 'config', 'menuconfig', 'if']
     _general_exits = ['endmenu', 'endchoice', 'endif']
-    _soft_exits = ['config']
     _var_types = ['bool', 'tristate', 'int', 'string']
-    _help_exits = ['select', 'config', 'menu']
+    _help_exits = _general_starts + _general_exits + _var_types
     arch = "x86"
     base_path = "/usr/src/linux"
 
@@ -45,10 +44,11 @@ class KConfig:
             if getattr(self, f"in_{mode}"):
                 self.logger.info("Initializing KConfig object with %s: %s" % (mode, getattr(self, f"in_{mode}")))
 
-        self.config_types = ['config', 'menu', 'sub_configs']
+        self.config_types = self._general_starts + ['sub_configs']
         for config_type in self.config_types:
             setattr(self, config_type, dict())
 
+        self.mode_history = list()
         self.help_mode = False
 
         self.file_path = file_path
@@ -69,6 +69,20 @@ class KConfig:
             for line in config_file:
                 self.parse_line(line)
 
+    def __setattr__(self, name, value):
+        """
+        Custom setattr, used to change how the mode is updated
+        if the mode is changed, the last mode gets saved in a list called mode_history.
+        If the mode is changed to None, the last mode gets popped and that is used to set the new mode
+        """
+        if name == 'mode':
+            if value:
+                self.mode_history.append(value)
+            else:
+                value = self.mode_history.pop()
+                self.logger.info("Restoring mode to: %s" % value)
+        super().__setattr__(name, value)
+
     def _skip_line(self, config_line):
         """
         Checks if a line should be skipped
@@ -86,22 +100,35 @@ class KConfig:
         """
         Exits the current config mode based on the mode type
         """
-        if 'endmenu' in config_line:
-            self.logger.info("Exiting menu: %s" % self.in_menu)
-            self.in_menu = None
-        elif 'endchoice' in config_line:
-            self.logger.info("Exiting choice: %s" % self.in_choice)
-            self.in_choice = None
-        elif 'endif' in config_line:
-            self.logger.info("Exiting if statement")
-            self.in_if = None
-        self.help_mode = False
+        for exit in self._general_exits:
+            if exit in config_line:
+                self.logger.info("Exiting mode: %s" % self.mode)
+                self.mode = None
+        if self.help_mode:
+            self.help_mode = False
+            self.logger.info("Exiting help mode for %s" % getattr(self, 'current_' + self.mode))
+            self.logger.debug("Config line: %s" % config_line)
 
     def _enter_mode(self, config_line):
         """
         Enters a new config mode based on the mode type
         """
-        if " " in config_line:
+        if config_line == 'help':
+            self.help_mode = True
+            # Checks if the current mode dict has a help key, initialized it to an empty string if not
+            if 'help' not in getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]:
+                getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['help'] = ''
+                self.logger.debug("Initializing help for %s" % getattr(self, 'current_' + self.mode))
+            self.logger.info("Entering help mode for %s" % getattr(self, 'current_' + self.mode))
+        elif self.help_mode:
+            self.help_mode = False
+            self.logger.info("Exiting help mode implicitly for %s" % getattr(self, 'current_' + self.mode))
+        else:
+            mode = config_line
+            self.logger.info("Entering mode: %s" % mode)
+            self.mode = mode
+
+        if " " in config_line and not self.help_mode:
             mode, name = config_line.split(" ", 1)
             self.logger.info("Entering mode '%s' with prompt: %s" % (mode, name))
             self.mode = mode
@@ -109,10 +136,6 @@ class KConfig:
                 getattr(self, mode)[name] = dict()
                 self.logger.debug("Initializing %s: %s" % (mode, name))
             setattr(self, 'current_' + mode, name)
-        else:
-            mode = config_line
-            self.logger.info("Entering mode: %s" % mode)
-            self.mode = mode
 
     def _process_var(self, config_line):
         """
@@ -120,49 +143,97 @@ class KConfig:
 
         returns an error if not in config or menuconfig mode
         """
-        if self.mode not in ['config', 'menuconfig']:
+        if self.mode not in ['config', 'menuconfig', 'choice']:
             raise ValueError("Found variable definition outside of config or menuconfig mode: %s" % config_line)
+
+        if self.mode == 'choice':
+            self.logger.info("Setting variable for choice: %s" % config_line)
+            prompt = config_line.split('"')[1]
+            if not hasattr(self.choice, prompt):
+                self.choice[prompt] = dict()
+                self.logger.debug("Initializing choice: %s" % prompt)
+            self.current_choice = prompt
+
+        if config_line.startswith('def_'):
+            default = config_line.split('def_')[1]
+            self.logger.info("Setting default for %s: %s" % (getattr(self, 'current_' + self.mode), default))
+            getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['default'] = default
+            config_line = config_line.split('def_')[0]
+
+        current_block = getattr(self, 'current_' + self.mode)
+        if ' ' in config_line:
+            var, value = config_line.split(' ', 1)
+            self.logger.info("Setting variable %s to %s" % (var, value))
+            getattr(self, self.mode)[current_block]['type'] = var
+            getattr(self, self.mode)[current_block]['prompt'] = value.strip('"')
+        else:
+            getattr(self, self.mode)[current_block]['type'] = config_line
+            self.logger.info("Set type for %s: %s" % (current_block, config_line))
+
+    def _test_start(self, config_line):
+        """
+        Tests if a line is the start of a new config mode
+        """
+        if hasattr(self, 'mode') and self.mode:
+            config_line = config_line.lstrip()
+            self.logger.debug("Cleaning config line because mode is set: %s" % config_line)
+        for start in self._general_starts:
+            if re.search(r'^%s( |$)' % start, config_line):
+                return True
+        if config_line.lstrip() == 'help':
+            return True
+        self.logger.debug("Line is not a new config mode: %s" % config_line)
+        return False
+
+    def _test_var(self, config_line):
+        """
+        Tests if a line is a variable definition
+        """
+        for var in self._var_types:
+            if re.search(r'^%s( |$)' % var, config_line):
+                return True
+            elif re.search(r'^def_%s( |$)' % var, config_line):
+                return True
+        self.logger.debug("Line is not a variable definition: %s" % config_line)
+        return False
 
     def parse_line(self, config_line):
         """
         Parses a line from a KConfig file
         """
-        config_line = config_line.strip()
+        config_line = config_line.rstrip()
         config_line = self.substitute_vars(config_line)
 
         if self._skip_line(config_line):
+            self.logger.log(5, "Skipping line: %s" % config_line)
             return
-
-        if config_line in self._soft_exits:
-            self.exit_mode(config_line)
 
         if config_line in self._general_exits:
             return self._exit_mode(config_line)
 
-        if any([config_line.startswith(config_type) for config_type in self._general_starts]):
-            return self._enter_mode(config_line)
+        if config_line.lstrip().startswith('prompt'):
+            name = config_line.split(' ', 1)[1]
+            if not hasattr(getattr(self, self.mode), name):
+                getattr(self, self.mode)[name] = dict()
+                self.logger.debug("Setting prompt for %s: %s" % (self.mode, name))
+            setattr(self, 'current_' + self.mode, name)
+            return
 
-        if any([config_line.startswith(config_type) for config_type in self._var_types]):
+        if self._test_start(config_line):
+            return self._enter_mode(config_line.lstrip())
+
+        # strip spaces now that they are no longer needed
+        config_line = config_line.lstrip()
+
+        if self._test_var(config_line):
             return self._process_var(config_line)
 
         if self.help_mode:
-            # Checks if the current mode dict has a help key, initialized it to an empty string if not
-            if 'help' not in getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]:
-                getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['help'] = ''
-            # If another defintion is found, exit help mode, otherwise append the line to the help string
-            if True in [config_line.startswith(config_type) for config_type in self._help_exits]:
-                self.help_mode = False
-            else:
-                self.logger.debug("Appending help line: %s" % config_line)
-                getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['help'] += config_line
-        # if help mode hasn't been exited, skip the rest of the parsing
-        if self.help_mode:
+            self.logger.debug("Appending help line: %s" % config_line)
+            getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['help'] += config_line
             return
 
-        elif config_line == 'help':
-            self.logger.info("Found help line")
-            self.help_mode = True
-        elif re.search(self._source_regex, config_line):
+        if re.search(self._source_regex, config_line):
             # Handles source lines, which are just other config files
             # Uses the base path and the content between the quotes
             source_path = config_line.split()[1].strip('\"')
