@@ -13,7 +13,6 @@ if __name__ == '__main__':
     stdout_handler.setFormatter(ColorLognameFormatter(fmt='%(levelname)s | %(name)-70s | %(message)s'))
     logger.addHandler(stdout_handler)
 
-
     kconfig = KConfig()
     kconfig.print_all_configs()
     exit()

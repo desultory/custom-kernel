@@ -21,11 +21,15 @@ class KConfig:
     They share a common base path and architecture, and can be used to parse KConfig files
     """
     _source_regex = r'source\s+\"(.*)\"'
-    _help_exits = ['select', 'config', 'menu', 'endmenu', 'endchoice', 'endif']
+    _general_starts = ['menu', 'choice', 'config', 'if']
+    _general_exits = ['endmenu', 'endchoice', 'endif']
+    _soft_exits = ['config']
+    _var_types = ['bool', 'tristate', 'int', 'string']
+    _help_exits = ['select', 'config', 'menu']
     arch = "x86"
     base_path = "/usr/src/linux"
 
-    def __init__(self, file_path="Kconfig", menu=None, base_path=None, arch=None, *args, **kwargs):
+    def __init__(self, file_path="Kconfig", menu=None, choice=None, base_path=None, arch=None, *args, **kwargs):
         """
         Creates a KConfig object
         """
@@ -36,9 +40,10 @@ class KConfig:
             self.logger.info("Overriding attribute: arch: %s -> %s" % (self.arch, arch))
             self.arch = arch
 
-        self.in_menu = menu
-        if menu:
-            self.logger.info("Initializing KConfig object with menu: %s" % menu)
+        for mode in self._general_starts:
+            setattr(self, f"in_{mode}", kwargs.get(mode, None))
+            if getattr(self, f"in_{mode}"):
+                self.logger.info("Initializing KConfig object with %s: %s" % (mode, getattr(self, f"in_{mode}")))
 
         self.config_types = ['config', 'menu', 'sub_configs']
         for config_type in self.config_types:
@@ -64,6 +69,60 @@ class KConfig:
             for line in config_file:
                 self.parse_line(line)
 
+    def _skip_line(self, config_line):
+        """
+        Checks if a line should be skipped
+        """
+        if config_line.startswith('#'):
+            self.logger.debug("Skipping comment: %s" % config_line)
+            return True
+        elif config_line == '':
+            self.logger.debug("Skipping empty line")
+            return True
+        else:
+            return False
+
+    def _exit_mode(self, config_line):
+        """
+        Exits the current config mode based on the mode type
+        """
+        if 'endmenu' in config_line:
+            self.logger.info("Exiting menu: %s" % self.in_menu)
+            self.in_menu = None
+        elif 'endchoice' in config_line:
+            self.logger.info("Exiting choice: %s" % self.in_choice)
+            self.in_choice = None
+        elif 'endif' in config_line:
+            self.logger.info("Exiting if statement")
+            self.in_if = None
+        self.help_mode = False
+
+    def _enter_mode(self, config_line):
+        """
+        Enters a new config mode based on the mode type
+        """
+        if " " in config_line:
+            mode, name = config_line.split(" ", 1)
+            self.logger.info("Entering mode '%s' with prompt: %s" % (mode, name))
+            self.mode = mode
+            if not hasattr(getattr(self, mode), name):
+                getattr(self, mode)[name] = dict()
+                self.logger.debug("Initializing %s: %s" % (mode, name))
+            setattr(self, 'current_' + mode, name)
+        else:
+            mode = config_line
+            self.logger.info("Entering mode: %s" % mode)
+            self.mode = mode
+
+    def _process_var(self, config_line):
+        """
+        Processes a variable definition
+
+        returns an error if not in config or menuconfig mode
+        """
+        if self.mode not in ['config', 'menuconfig']:
+            raise ValueError("Found variable definition outside of config or menuconfig mode: %s" % config_line)
+
     def parse_line(self, config_line):
         """
         Parses a line from a KConfig file
@@ -71,13 +130,20 @@ class KConfig:
         config_line = config_line.strip()
         config_line = self.substitute_vars(config_line)
 
-        # Checks if the line is a comment or empty, and skips it if so
-        if config_line.startswith('#'):
-            self.logger.debug("Skipping comment: %s" % config_line)
+        if self._skip_line(config_line):
             return
-        elif config_line == '':
-            self.logger.debug("Skipping empty line")
-            return
+
+        if config_line in self._soft_exits:
+            self.exit_mode(config_line)
+
+        if config_line in self._general_exits:
+            return self._exit_mode(config_line)
+
+        if any([config_line.startswith(config_type) for config_type in self._general_starts]):
+            return self._enter_mode(config_line)
+
+        if any([config_line.startswith(config_type) for config_type in self._var_types]):
+            return self._process_var(config_line)
 
         if self.help_mode:
             # Checks if the current mode dict has a help key, initialized it to an empty string if not
@@ -93,10 +159,6 @@ class KConfig:
         if self.help_mode:
             return
 
-        if config_line == 'endmenu':
-            self.logger.info("Found endmenu line")
-            self.mode = None
-            self.in_menu = None
         elif config_line == 'help':
             self.logger.info("Found help line")
             self.help_mode = True
@@ -108,65 +170,14 @@ class KConfig:
             if source_path.endswith(".include"):
                 self.logger.warning("Skipping include file: %s" % source_path)
                 return
+            kwargs = {'logger': self.logger, 'file_path': source_path}
+
             if self.in_menu:
-                self.sub_configs[source_path] = KConfig(file_path=source_path, menu=self.in_menu, logger=self.logger)
-            else:
-                self.sub_configs[source_path] = KConfig(file_path=source_path, logger=self.logger)
-        elif config_line.startswith('config '):
-            self.current_config = config_line.split()[1]
-            if self.current_config not in self.config:
-                self.config[self.current_config] = dict()
-            else:
-                self.logger.warning("Config already exists: %s" % self.current_config)
-            self.logger.info("Found config line: %s" % config_line)
-            self.mode = 'config'
-        elif config_line.startswith('menu '):
-            self.in_menu = config_line.split()[1]
-        elif config_line.startswith('menuconfig '):
-            if '"' in config_line:
-                self.current_menu = config_line.split('"')[1]
-            else:
-                self.current_menu = config_line.split()[1]
-            if self.current_menu not in self.menu:
-                self.menu[self.current_menu] = dict()
-            else:
-                self.logger.warning("Menu already exists: %s" % self.current_menu)
-            self.logger.info("Found menu line: %s" % config_line)
-            self.mode = 'menu'
-        elif config_line.startswith('select '):
-            select = config_line.split()[1]
-            current_mode = getattr(self, 'current_' + self.mode)
-            if 'select' not in getattr(self, self.mode)[current_mode]:
-                getattr(self, self.mode)[current_mode]['select'] = dict()
-            self.logger.info("[%s] Found %s select line: %s" % (self.mode, current_mode, config_line))
-            self.process_select(select)
-        elif config_line.startswith('default '):
-            default = config_line.split()[1:]
-            self.logger.info("Found default line: %s" % config_line)
-            getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['default'] = default
-        elif config_line == 'bool':
-            self.logger.info("Found basic bool line")
-            getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['type'] = 'bool'
-        elif config_line.startswith('bool '):
-            getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['type'] = 'bool'
-            prompt = config_line.split('"')[1]
-            self.logger.info("Found bool line with prompt: %s" % config_line)
-            getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['prompt'] = prompt.strip('\"')
-        elif config_line.startswith('def_bool '):
-            getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['type'] = 'bool'
-            default = config_line.split()[1:]
-            self.logger.info("Found bool line with default: %s" % config_line)
-            getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['default'] = default
-        elif config_line == 'string':
-            self.logger.info("Found basic string line")
-            getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['type'] = 'string'
-        elif config_line.startswith('string '):
-            prompt = config_line.split('"')[1]
-            self.logger.info("Found string line with prompt: %s" % config_line)
-            getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['prompt'] = prompt.strip('\"')
-        elif config_line == 'int':
-            self.logger.info("Found basic int line")
-            getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['type'] = 'int'
+                kwargs['menu'] = self.in_menu
+            if self.in_choice:
+                kwargs['choice'] = self.in_choice
+
+            self.sub_configs[source_path] = KConfig(**kwargs)
         else:
             self.logger.warning("Unknown line type: %s" % config_line)
 
