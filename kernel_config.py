@@ -54,12 +54,6 @@ class KConfig:
         self.file_path = file_path
         self.parse_config()
 
-    #    for thread, exception in self._threads:
-    #        thread.join()
-    #        while not exception.empty():
-    #            self.logger.error("Exception in thread: %s" % exception.get())
-
-    # @threaded
     def parse_config(self):
         """
         Parses a KConfig file
@@ -292,7 +286,10 @@ class KConfig:
             if config_type == 'sub_configs':
                 self.logger.debug("Skipping sub_configs")
                 continue
-            print(f"Printing {config_type}:")
+            if not getattr(self, config_type):
+                self.logger.debug("Skipping empty config type: %s" % config_type)
+                continue
+            print(f"{config_type}:")
             for name, config in getattr(self, config_type).items():
                 print(f"{name}: {config}")
 
