@@ -154,10 +154,6 @@ def class_logger(cls):
     Decorator for classes to add a logging object and log basic tasks
     """
     class ClassWrapper(cls):
-        __name__ = cls.__name__
-        __module__ = cls.__module__
-        __qualname__ = cls.__qualname__
-
         def __init__(self, *args, **kwargs):
             parent_logger = kwargs.pop('logger') if isinstance(kwargs.get('logger'), logging.Logger) else logging.getLogger()
             self.logger = parent_logger.getChild(cls.__name__)
@@ -202,6 +198,10 @@ def class_logger(cls):
                 self.logger.log(5, "Set '%s' to:\n%s" % (name, value))
             else:
                 self.logger.log(5, "Set '%s' to: %s" % (name, value))
+
+    ClassWrapper.__name__ = cls.__name__
+    ClassWrapper.__module__ = cls.__module__
+    ClassWrapper.__qualname__ = cls.__qualname__
 
     return ClassWrapper
 

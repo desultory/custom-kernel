@@ -3,13 +3,179 @@
 Used to create kernel configuration files for specific hardware configurations
 """
 
-__version__ = "0.0.3"
+__version__ = "0.2.0"
 
 from zen_custom import class_logger, handle_plural
 
 from collections import OrderedDict
+from enum import Enum
 
 import re
+
+
+class KConfigSubtype(type):
+    """
+    Metaclass for KConfigParameter, used to return the correct subtype on creation
+    """
+    def __call__(cls, *args, **kwargs):
+        """
+        Returns the correct subtype based on either the type parameter or the config line
+        """
+        if 'type' not in kwargs and not args:
+            return super().__call__(*args, **kwargs)
+
+        if 'type' in kwargs:
+            t = kwargs.pop('type')
+            return getattr(KConfigTypes, t).value(*args, **kwargs)
+
+        for t in KConfigTypes:
+            if match := re.search(t.value.start_regex, args[0]):
+                # Remove the first argument, which is the config line
+                args = args[1:]
+                if prompt := match.group(1):
+                    kwargs['value'] = prompt
+                return t.value(*args, **kwargs)
+        return super().__call__(*args, **kwargs)
+
+
+def parse_with_type(cls):
+    """
+    Decorator for KConfigParameter subclasses, adds variable parsing functionality
+    """
+    class KConfigParameterWithType(cls):
+        _variable_type_regex = r'^\s*{var_type}\s*"?(.+)(?:")$'
+        variable_types = ['string', 'bool', 'tristate']
+
+        def _init_parameters(self):
+            """
+            Custom init_parameters extention for KConfigParameterWithType
+            """
+            super()._init_parameters()
+            self.parameters['variable_type'] = None
+
+        def process_line(self, config_line):
+            """
+            Process the config line, handling variables
+            """
+            # First use the super function
+            super_result = super().process_line(config_line)
+
+            self.logger.debug("Attempting to process type information: %s" % config_line)
+            # Check if the line contains a variable type
+            for var_type in self.variable_types:
+                re_str = self._variable_type_regex.format(var_type=var_type)
+                self.logger.debug("Compiled regex: %s" % re_str)
+                if match := re.search(re_str, config_line):
+                    self.logger.debug("Found variable type: %s" % var_type)
+                    self.variable_type = var_type
+                    if value := match.group(1):
+                        self.logger.debug("Found variable value: %s" % value)
+                        self.value = value
+                    return True
+            return super_result
+
+    KConfigParameterWithType.__name__ = cls.__name__
+
+    return KConfigParameterWithType
+
+
+@class_logger
+class KConfigParameter(metaclass=KConfigSubtype):
+    """
+    Abstraction of a general KConfig Parameter
+    """
+    def _init_parameters(self):
+        """
+        Initializes self.parameters, extended by subclasses
+        """
+        self.parameters = {'default': None,
+                           'value': None}
+
+    def __init__(self, *args, **kwargs):
+        """
+        Creates a KConfigParameter object
+        """
+        self._init_parameters()
+
+        for parameter in self.parameters:
+            if parameter in kwargs:
+                setattr(self, parameter, kwargs.pop(parameter))
+            else:
+                setattr(self, parameter, self.parameters[parameter])
+
+    def process_line(self, config_line):
+        """
+        Parses a line from a KConfig file
+        """
+        self.logger.debug("Attempting to process line: %s" % config_line)
+        return False
+
+    def __str__(self):
+        """
+        Returns a string representation of the KConfigParameter
+        """
+        out_str = f"{self.__class__.__name__}: "
+        (out_str.append(getattr(self, parameter)) for parameter in self.parameters if parameter)
+        return out_str
+
+
+class KConfigChoice(KConfigParameter):
+    """
+    Abstraction of a linux kernel KConfig choice option
+    """
+    # Choices start with "choice" followed by nothing, or the choice name
+    # Captures the prompt name if present
+    start_regex = r'choice\s*(.+)*'
+    end_regex = '^endchoice.*$'
+
+
+class KConfigMenu(KConfigParameter):
+    """
+    Abstraction of a linux kernel KConfig menu option
+    """
+    # Menus start with "menu" followed by nothing, or the menu name
+    # Captures the prompt name if present
+    start_regex = r'^menu\s*(.+)*$'
+    end_regex = '^endmenu.*$'
+
+
+@parse_with_type
+class KConfigMenuconfig(KConfigParameter):
+    """
+    Abstraction of a linux kernel KConfig menuconfig option
+    """
+    # Menuconfigs start with "menuconfig" followed by nothing, or the menuconfig name
+    # Captures the prompt name if present
+    start_regex = r'menuconfig\s*(.+)*'
+
+
+@parse_with_type
+class KConfigConfig(KConfigParameter):
+    """
+    Abstraction of a linux kernel KConfig config option
+    """
+    # Configs start with "config" followed by the config name
+    # Captures the prompt name if present
+    start_regex = r'^config\s*(.+)*$'
+    variable_type = None
+
+
+class KConfigIf(KConfigParameter):
+    """
+    Abstraction of a linux kernel KConfig if option
+    """
+    # Ifs start with "if" followed by the if name
+    # Captures the prompt name if present
+    start_regex = r'if\s*(.+)*'
+    end_regex = r'^endif.*$'
+
+
+class KConfigTypes(Enum):
+    choice = KConfigChoice
+    menu = KConfigMenu
+    menuconfig = KConfigMenuconfig
+    config = KConfigConfig
+    _if = KConfigIf
 
 
 @class_logger
@@ -20,38 +186,18 @@ class KConfig:
     All KConfig objects are meant to be used as a collection of KConfigParameter objects
     They share a common base path and architecture, and can be used to parse KConfig files
     """
-    _source_regex = r'source\s+\"(.*)\"'
-    _general_starts = ['menu', 'choice', 'config', 'menuconfig', 'if']
-    _general_exits = ['endmenu', 'endchoice', 'endif']
-    _var_types = ['bool', 'tristate', 'int', 'string']
-    _help_exits = _general_starts + _general_exits + _var_types
-    arch = "x86"
-    base_path = "/usr/src/linux"
+    _source_re = r'^source\s+"(.+)"$'
 
-    def __init__(self, file_path="Kconfig", menu=None, choice=None, base_path=None, arch=None, *args, **kwargs):
+    def __init__(self, file_path="Kconfig", base_path="/usr/src/linux", arch="x86", *args, **kwargs):
         """
         Creates a KConfig object
         """
-        if base_path:
-            self.logger.info("Overriding attribute: base_path: %s -> %s" % (self.base_path, base_path))
-            self.base_path = base_path
-        if arch:
-            self.logger.info("Overriding attribute: arch: %s -> %s" % (self.arch, arch))
-            self.arch = arch
-
-        for mode in self._general_starts:
-            setattr(self, f"in_{mode}", kwargs.get(mode, None))
-            if getattr(self, f"in_{mode}"):
-                self.logger.info("Initializing KConfig object with %s: %s" % (mode, getattr(self, f"in_{mode}")))
-
-        self.config_types = self._general_starts + ['sub_configs']
-        for config_type in self.config_types:
-            setattr(self, config_type, dict())
-
-        self.mode_history = list()
-        self.help_mode = False
-
         self.file_path = file_path
+        self.base_path = base_path
+        self.arch = arch
+
+        self.sub_configs = dict()
+
         self.parse_config()
 
     def parse_config(self):
@@ -63,200 +209,56 @@ class KConfig:
             for line in config_file:
                 self.parse_line(line)
 
-    def __setattr__(self, name, value):
-        """
-        Custom setattr, used to change how the mode is updated
-        if the mode is changed, the last mode gets saved in a list called mode_history.
-        If the mode is changed to None, the last mode gets popped and that is used to set the new mode
-        """
-        if name == 'mode':
-            if value:
-                self.mode_history.append(value)
-            else:
-                value = self.mode_history.pop()
-                self.logger.info("Restoring mode to: %s" % value)
-        super().__setattr__(name, value)
-
     def _skip_line(self, config_line):
         """
         Checks if a line should be skipped
         """
         if config_line.startswith('#'):
-            self.logger.debug("Skipping comment: %s" % config_line)
+            self.logger.log(5, "Skipping comment: %s" % config_line)
             return True
         elif config_line == '':
-            self.logger.debug("Skipping empty line")
+            self.logger.log(5, "Skipping empty line")
             return True
         else:
             return False
-
-    def _exit_mode(self, config_line):
-        """
-        Exits the current config mode based on the mode type
-        """
-        for exit in self._general_exits:
-            if exit in config_line:
-                self.logger.info("Exiting mode: %s" % self.mode)
-                self.mode = None
-        if self.help_mode:
-            self.help_mode = False
-            self.logger.info("Exiting help mode for %s" % getattr(self, 'current_' + self.mode))
-            self.logger.debug("Config line: %s" % config_line)
-
-    def _enter_mode(self, config_line):
-        """
-        Enters a new config mode based on the mode type
-        """
-        if config_line == 'help':
-            self.help_mode = True
-            # Checks if the current mode dict has a help key, initialized it to an empty string if not
-            if 'help' not in getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]:
-                getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['help'] = ''
-                self.logger.debug("Initializing help for %s" % getattr(self, 'current_' + self.mode))
-            self.logger.info("Entering help mode for %s" % getattr(self, 'current_' + self.mode))
-        elif self.help_mode:
-            self.help_mode = False
-            self.logger.info("Exiting help mode implicitly for %s" % getattr(self, 'current_' + self.mode))
-        else:
-            mode = config_line
-            self.logger.info("Entering mode: %s" % mode)
-            self.mode = mode
-
-        if " " in config_line and not self.help_mode:
-            mode, name = config_line.split(" ", 1)
-            self.logger.info("Entering mode '%s' with prompt: %s" % (mode, name))
-            self.mode = mode
-            if not hasattr(getattr(self, mode), name):
-                getattr(self, mode)[name] = dict()
-                self.logger.debug("Initializing %s: %s" % (mode, name))
-            setattr(self, 'current_' + mode, name)
-
-    def _process_var(self, config_line):
-        """
-        Processes a variable definition
-
-        returns an error if not in config or menuconfig mode
-        """
-        if self.mode not in ['config', 'menuconfig', 'choice']:
-            raise ValueError("Found variable definition outside of config or menuconfig mode: %s" % config_line)
-
-        if self.mode == 'choice':
-            self.logger.info("Setting variable for choice: %s" % config_line)
-            prompt = config_line.split('"')[1]
-            if not hasattr(self.choice, prompt):
-                self.choice[prompt] = dict()
-                self.logger.debug("Initializing choice: %s" % prompt)
-            self.current_choice = prompt
-
-        if config_line.startswith('def_'):
-            default = config_line.split('def_')[1]
-            self.logger.info("Setting default for %s: %s" % (getattr(self, 'current_' + self.mode), default))
-            getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['default'] = default
-            config_line = config_line.split('def_')[0]
-
-        current_block = getattr(self, 'current_' + self.mode)
-        if ' ' in config_line:
-            var, value = config_line.split(' ', 1)
-            self.logger.info("Setting variable %s to %s" % (var, value))
-            getattr(self, self.mode)[current_block]['type'] = var
-            getattr(self, self.mode)[current_block]['prompt'] = value.strip('"')
-        else:
-            getattr(self, self.mode)[current_block]['type'] = config_line
-            self.logger.info("Set type for %s: %s" % (current_block, config_line))
-
-    def _test_start(self, config_line):
-        """
-        Tests if a line is the start of a new config mode
-        """
-        if hasattr(self, 'mode') and self.mode:
-            config_line = config_line.lstrip()
-            self.logger.debug("Cleaning config line because mode is set: %s" % config_line)
-        for start in self._general_starts:
-            if re.search(r'^%s( |$)' % start, config_line):
-                return True
-        if config_line.lstrip() == 'help':
-            return True
-        self.logger.debug("Line is not a new config mode: %s" % config_line)
-        return False
-
-    def _test_var(self, config_line):
-        """
-        Tests if a line is a variable definition
-        """
-        for var in self._var_types:
-            if re.search(r'^%s( |$)' % var, config_line):
-                return True
-            elif re.search(r'^def_%s( |$)' % var, config_line):
-                return True
-        self.logger.debug("Line is not a variable definition: %s" % config_line)
-        return False
 
     def parse_line(self, config_line):
         """
         Parses a line from a KConfig file
         """
+        # First remove the trailing spaces and newline
         config_line = config_line.rstrip()
+        # Substitute the vars if possible
         config_line = self.substitute_vars(config_line)
 
+        # Skip the line if it shouldn't be processed
         if self._skip_line(config_line):
             self.logger.log(5, "Skipping line: %s" % config_line)
             return
 
-        if config_line in self._general_exits:
-            return self._exit_mode(config_line)
-
-        if config_line.lstrip().startswith('prompt'):
-            name = config_line.split(' ', 1)[1]
-            if not hasattr(getattr(self, self.mode), name):
-                getattr(self, self.mode)[name] = dict()
-                self.logger.debug("Setting prompt for %s: %s" % (self.mode, name))
-            setattr(self, 'current_' + self.mode, name)
+        # Check if the line is a source line and process it if so
+        if re.search(self._source_re, config_line):
+            source = re.search(self._source_re, config_line).group(1)
+            self.logger.debug("Source line found: %s" % source)
+            self.process_source(source)
+            self.logger.info("Added source: %s" % source)
+        # Attempt to process the line with the current config parameter if it's set
+        elif hasattr(self, 'current_parameter') and self.current_parameter.process_line(config_line):
+            self.logger.debug("Line processed using current parameter: %s" % self.current_parameter)
             return
+        # Create a new config parameter using the line
+        elif line_config := KConfigParameter(config_line):
+            self.logger.info("Found config line: %s" % line_config)
+            self.current_parameter = line_config
 
-        if self._test_start(config_line):
-            return self._enter_mode(config_line.lstrip())
-
-        # strip spaces now that they are no longer needed
-        config_line = config_line.lstrip()
-
-        if self._test_var(config_line):
-            return self._process_var(config_line)
-
-        if self.help_mode:
-            self.logger.debug("Appending help line: %s" % config_line)
-            getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['help'] += config_line
+    def process_source(self, source):
+        """
+        Processes a source line
+        """
+        if source.endswith(".include"):
+            self.logger.warning("Skipping include: %s" % source)
             return
-
-        if re.search(self._source_regex, config_line):
-            # Handles source lines, which are just other config files
-            # Uses the base path and the content between the quotes
-            source_path = config_line.split()[1].strip('\"')
-            self.logger.info("Found source line: %s" % source_path)
-            if source_path.endswith(".include"):
-                self.logger.warning("Skipping include file: %s" % source_path)
-                return
-            kwargs = {'logger': self.logger, 'file_path': source_path}
-
-            if self.in_menu:
-                kwargs['menu'] = self.in_menu
-            if self.in_choice:
-                kwargs['choice'] = self.in_choice
-
-            self.sub_configs[source_path] = KConfig(**kwargs)
-        else:
-            self.logger.warning("Unknown line type: %s" % config_line)
-
-    def process_select(self, config_line):
-        """
-        Processes a select line
-        """
-        if 'if' in config_line:
-            self.logger.info("Found select if line: %s" % config_line)
-            select, if_statement = config_line.split('if')
-            self.logger.warning("Select if statement not implemented: %s" % if_statement)
-        else:
-            self.logger.info("Found basic select line: %s" % config_line)
-            getattr(self, self.mode)[getattr(self, 'current_' + self.mode)]['select'][config_line] = dict()
+        self.sub_configs[source] = KConfig(base_path=self.base_path, arch=self.arch, file_path=source)
 
     def substitute_vars(self, config_line):
         """
@@ -270,32 +272,17 @@ class KConfig:
 
         return config_line
 
-    def print_all_sub_configs(self):
+    def __str__(self):
         """
-        Prints all sub configs, recursively
+        prints the contents of the KConfig object
         """
-        for name, config in self.sub_configs.items():
-            print(f"Sub Config: {name}")
-            config.print_all_sub_configs()
+        out_str = f"Printing config for: {self.base_path}/{self.file_path}\n"
+        if hasattr(self, 'current_parameter'):
+            out_str += str(self.current_parameter)
 
-    def print_all_configs(self):
-        """
-        Prints all configs, including sub configs
-        """
-        for config_type in self.config_types:
-            if config_type == 'sub_configs':
-                self.logger.debug("Skipping sub_configs")
-                continue
-            if not getattr(self, config_type):
-                self.logger.debug("Skipping empty config type: %s" % config_type)
-                continue
-            print(f"{config_type}:")
-            for name, config in getattr(self, config_type).items():
-                print(f"{name}: {config}")
-
-        for name, config in self.sub_configs.items():
-            print(f"Sub Config: {name}")
-            config.print_all_configs()
+        for config in self.sub_configs.values():
+            out_str += str(config)
+        return out_str
 
 
 @class_logger
